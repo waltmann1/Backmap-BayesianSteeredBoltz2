@@ -1,6 +1,6 @@
 <div align="center">
   <div>&nbsp;</div>
-  <img src="docs/github_logo_v3.png" width="450"/>
+  <img src="docs/github_logo_v4.png" width="450"/>
 </div>
 
 ## Running Boltz-2 conditional on arbitrary Bayesian likelihoods
