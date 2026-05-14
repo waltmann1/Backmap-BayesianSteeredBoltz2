@@ -4,7 +4,16 @@
 </div>
 
 ## Running Boltz-2 conditional on arbitrary Bayesian likelihoods
-We have implemented an interface that allows users to condition protein structure predictions on arbitrary constraints within Boltz-2. To do this, we adopt a Bayesian framework where the Boltz-2 foundation model is treated as a prior. The user then designs a likelihood function which expresses some relation between the atomic coordinates of the structure and the desired constraint or property. With this input, our modified form of Boltz-2 will run twisted diffusion to draw samples from the posterior distribution. If you use this code for your applications, please cite our paper.
+We have implemented an interface that allows users to condition protein structure predictions on arbitrary constraints within Boltz-2. To do this, we adopt a Bayesian framework where the Boltz-2 foundation model is treated as a prior. The user then designs a likelihood function which expresses some relation between the atomic coordinates of the structure and the desired constraint or property. With this input, our modified form of Boltz-2 will run twisted diffusion to draw samples from the posterior distribution. If you use this code for your applications, please cite our paper [Bayesian-Steered Structure Prediction of Mechanical Biomoleculues Using Twisted Diffusion](https://www.biorxiv.org/cgi/content/short/2026.05.11.724187v1).
+
+```bibtex
+@article{Klaus2026.05.11.724187,
+  title={Bayesian-Steered Structure Prediction of Mechanical Biomolecules Using Twisted Diffusion},
+  author={Klaus, Colin and Sotomayor, Marcos},
+  journal={bioRxiv},
+  year={2026},
+}
+```
 
 To install our version of Boltz-2, we recommend creating and activating a fresh python environment, then running
 ```
