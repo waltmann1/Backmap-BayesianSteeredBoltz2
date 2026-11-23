@@ -323,7 +323,11 @@ class AtomDiffusion(Module):
             or steering_args["contact_guidance_update"]
             or steering_args["colvars_guidance_update"]
         ):
-            potentials = get_potentials(steering_args, boltz2=True)
+            # A caller may pass its own list of Potential objects through
+            # steering_args["potentials"]; otherwise behave exactly as before.
+            potentials = steering_args.get("potentials") or get_potentials(
+                steering_args, boltz2=True
+            )
 
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
