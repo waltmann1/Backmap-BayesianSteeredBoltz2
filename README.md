@@ -3,6 +3,18 @@
   <img src="docs/github_logo_v4.png" width="450"/>
 </div>
 
+## Branch `cg-potential`: coarse-grained backmapping (waltmann1 fork)
+This branch of the fork adds coarse-grained (CG) backmapping on top of the Bayesian-steered Boltz-2 code below: given CG bead positions, sample all-atom structures whose beads match them. It is the Boltz-2 engine for a future `msback2` (a pure-Python repo, successor to MSBack, which uses Chroma). Work in progress; stock Boltz behaviour is unchanged.
+
+- `src/boltz/colvars/cg_potential.py`: `CGMap`/`CGBead` (a bead is a weighted set of atoms identified by chain, residue position, atom name; a Cα preset is included) and `CGPotential`, a Gaussian likelihood (harmonic when `allowed=0`, width `sigma`, default 1 Å) on bead positions after rigid alignment of the target onto the sample.
+- `src/boltz/colvars/cg_sample.py`: `CGSampler` / `cg_sample()`, a pure-Python entry point (no CLI) that runs steered sampling and exposes `sigma`, `allowed`, particle and resampling settings and the diffusion hyperparameters.
+- `src/boltz/colvars/cg_loaders.py`: reads OpenMSCG/mstool map YAMLs and builds a Boltz input from a PDB. File formats are kept out of `CGPotential`.
+- Only edit to existing code: `diffusionv2.py` accepts `steering_args["potentials"]`, otherwise it falls back to `get_potentials`.
+- `tests/test_cg_potential.py` (no GPU needed), `cg_tests/mprotein/` (M-protein homodimer example).
+- `cluster/`: reproducible install and job scripts for the Beagle3 cluster, see [`cluster/README.md`](cluster/README.md).
+
+Known limits: very tight `sigma` (below about 0.75 Å) can make guidance diverge, with no guard yet. Only protein chains are supported by the loaders so far. See the upstream section below for the Bayesian-steering framework this builds on.
+
 ## Running Boltz-2 conditional on arbitrary Bayesian likelihoods
 We have implemented an interface that allows users to condition protein structure predictions on arbitrary constraints within Boltz-2. To do this, we adopt a Bayesian framework where the Boltz-2 foundation model is treated as a prior. The user then designs a likelihood function which expresses some relation between the atomic coordinates of the structure and the desired constraint or property. With this input, our modified form of Boltz-2 will run twisted diffusion to draw samples from the posterior distribution. If you use this code for your applications, please cite our paper [Bayesian-Steered Structure Prediction of Mechanical Biomoleculues Using Twisted Diffusion](https://www.biorxiv.org/cgi/content/short/2026.05.11.724187v1).
 
