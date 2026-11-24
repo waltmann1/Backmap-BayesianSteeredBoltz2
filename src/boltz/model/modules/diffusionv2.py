@@ -229,6 +229,12 @@ class AtomDiffusion(Module):
         self.alignment_reverse_diff = alignment_reverse_diff
         self.synchronize_sigmas = synchronize_sigmas
 
+        # Optional hooks (both None = stock behaviour), set by boltz.colvars.cg_fixed for fixed ("halo") atoms:
+        #   x0_hook(denoised, noised, network_condition_kwargs) -> denoised, applied to every x0 prediction
+        #   alignment_weights(feats) -> (n_atoms,) weights for the rigid re-alignment of the noisy coordinates onto x0
+        self.x0_hook = None
+        self.alignment_weights = None
+
         self.token_s = score_model_args["token_s"]
         self.register_buffer("zero", torch.tensor(0.0), persistent=False)
 
@@ -271,6 +277,10 @@ class AtomDiffusion(Module):
             self.c_skip(padded_sigma) * noised_atom_coords
             + self.c_out(padded_sigma) * r_update
         )
+        if self.x0_hook is not None:
+            denoised_coords = self.x0_hook(
+                denoised_coords, noised_atom_coords, network_condition_kwargs
+            )
         return denoised_coords
 
     def sample_schedule(self, num_sampling_steps=None):
@@ -610,17 +620,22 @@ class AtomDiffusion(Module):
 
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
+                    align_w = atom_mask.float()
+                    if self.alignment_weights is not None:
+                        align_w = align_w * self.alignment_weights(
+                            network_condition_kwargs["feats"]
+                        ).to(align_w)
                     atom_coords_noisy_noguidance = weighted_rigid_align(
                         atom_coords_noisy.float(),
                         atom_coords_denoised_noguidance.float(),
-                        atom_mask.float(),
-                        atom_mask.float(),
+                        align_w,
+                        align_w,
                     )
                     atom_coords_noisy = weighted_rigid_align(
                         atom_coords_noisy.float(),
                         atom_coords_denoised.float(),
-                        atom_mask.float(),
-                        atom_mask.float(),
+                        align_w,
+                        align_w,
                     )
                     wra_diff = atom_coords_noisy - atom_coords_noisy_noguidance
                     scaled_wra_diff = (1 + step_scale * (sigma_t - t_hat) / t_hat)*wra_diff

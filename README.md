@@ -9,11 +9,35 @@ This branch of the fork adds coarse-grained (CG) backmapping on top of the Bayes
 - `src/boltz/colvars/cg_potential.py`: `CGMap`/`CGBead` (a bead is a weighted set of atoms identified by chain, residue position, atom name; a Cα preset is included) and `CGPotential`, a Gaussian likelihood (harmonic when `allowed=0`, width `sigma`, default 1 Å) on bead positions after rigid alignment of the target onto the sample.
 - `src/boltz/colvars/cg_sample.py`: `CGSampler` / `cg_sample()`, a pure-Python entry point (no CLI) that runs steered sampling and exposes `sigma`, `allowed`, particle and resampling settings and the diffusion hyperparameters.
 - `src/boltz/colvars/cg_loaders.py`: reads OpenMSCG/mstool map YAMLs and builds a Boltz input from a PDB. File formats are kept out of `CGPotential`.
-- Only edit to existing code: `diffusionv2.py` accepts `steering_args["potentials"]`, otherwise it falls back to `get_potentials`.
-- `tests/test_cg_potential.py` (no GPU needed), `cg_tests/mprotein/` (M-protein homodimer example).
+- `src/boltz/colvars/cg_fixed.py`: `FixedAtoms`, known atoms (e.g. neighbouring chains, a "halo") that are held exactly in place while the other chains are sampled; see below.
+- Edits to existing code, all in `diffusionv2.py` and all inactive unless used: `steering_args["potentials"]` is used if given (otherwise `get_potentials`), and `AtomDiffusion` has two optional hooks, `x0_hook` and `alignment_weights`, both `None` by default.
+- `tests/test_cg_potential.py` and `tests/test_cg_fixed.py` (no GPU needed), `cg_tests/mprotein/` (M-protein homodimer example).
 - `cluster/`: reproducible install and job scripts for the Beagle3 cluster, see [`cluster/README.md`](cluster/README.md).
 
-Known limits: very tight `sigma` (below about 0.75 Å) can make guidance diverge, with no guard yet. Only protein chains are supported by the loaders so far. See the upstream section below for the Bayesian-steering framework this builds on.
+Known limits: very tight `sigma` (below about 0.75 Å, harmonic form) can make guidance diverge, with no guard yet. Only protein chains are supported by the loaders so far. Fixed atoms have only been tested with one fixed chain next to one free chain (a homodimer) and a few seeds; several fixed chains, other molecule types and larger numbers of seeds are untested.
+
+### Fixed ("halo") atoms
+```python
+from boltz.colvars.cg_fixed import FixedAtoms
+fixed = FixedAtoms.from_structure("neighbours.pdb", chains=["B"])   # heavy atoms, in the same frame as the CG targets
+res = sampler.sample(inputs_dict, "out", cg_map, target, fixed=fixed)  # cg_map/target include chain B's beads
+res.fixed_transform[0]   # rigid motion taking the sampled structure's frame onto the known frame (see apply_transform)
+```
+The fixed atoms end exactly at their known positions (up to that rigid motion) and the other chains are sampled around them. Three things make this work, and they are what `fixed=` switches on:
+1. **x0 mask**: every x0 prediction of the fixed atoms is replaced by the known coordinates, superposed on the current noisy fixed atoms (the sampler re-centres and rotates the coordinates every step).
+2. **Alignment on the fixed atoms only**: each step the sampler rigidly re-aligns the noisy coordinates onto x0 (`alignment_reverse_diff`, on by default). Fitted on all atoms, any mismatch of the free chain with its own prediction rotates the whole system relative to the fixed atoms, and the free chain ends up mis-posed. In a deterministic replay of a failing seed this took the free chain from 22.65 Å off (153 clashes) to 2.5 Å off (2 clashes). `AtomDiffusion.alignment_weights` limits that fit to the fixed atoms.
+3. **A non-forced template** (`fixed_template=True`, default): the fixed atoms are given to the trunk as a template with `force: false`, so the pair representation describes the geometry that is held fixed. This needs `inputs` as a dict. It improved the free chain's accuracy (internal RMSD about 1.3–1.6 Å against 2.2 Å) in the M-protein dimer test.
+
+Requirements: `step_scale=1` (the sampler's default here; otherwise the last step does not land on x0 and a warning is raised), the CG map should contain the fixed chains' beads (otherwise the free chain's placement against them is left to the prior; a warning is raised), and the fixed atoms' coordinates must be in the CG target frame.
+
+### What we learned about physical potentials (VDWOverlap) in the sampler
+`cg_sample` does not use Boltz's physical potentials unless you pass them in `extra_potentials`. Measured on the M-protein dimer (one free chain next to one fixed chain, 3 seeds per setting, so small samples; deterministic replays make single seeds reproducible):
+- **VDWOverlap guidance switched on early breaks the pose.** On from step 0 it failed in both seeds tested even at the stock strength (0.125): the free chain ended 7.8 and 18.0 Å off with 33 and 123 clashes. On only in the last 40% of the steps (Boltz's stock schedule) it was clean, and 1.0 in that late window (8× stronger) was also clean in 2 of 2 seeds. So timing matters, not strength.
+- **It is not a divergence problem.** The raw per-atom guidance stayed at about 6 or less (one unit per overlapping pair). The early-on runs pushed hundreds of atoms by 4–5 Å per step while the predicted structure was still forming, against 0.4–0.7 Å in the late phase.
+- A cap on the per-atom push (1 Å) partly rescued the early-on runs (10.5 → 4.6 Å and 4.4 → 2.0 Å) but is a backstop, not a fix.
+- **With no physical potentials and the alignment fix, 6 of 6 runs were clean** (free chain 2–3.5 Å from the truth, truth or previously predicted fixed chain), with up to 13 interface clashes that a frozen-fixed-atoms, bead-restrained OpenMM minimization removed (13 → 0 and 12 → 0 on the two worst, beads within 0.1 Å, fixed atoms unmoved, helices preserved). That minimization is not part of this package.
+- If you use VDW, use it only late (the last 40% of the steps or later) and consider capping its per-atom push. We do not recommend it on from the start.
+
 
 ## Running Boltz-2 conditional on arbitrary Bayesian likelihoods
 We have implemented an interface that allows users to condition protein structure predictions on arbitrary constraints within Boltz-2. To do this, we adopt a Bayesian framework where the Boltz-2 foundation model is treated as a prior. The user then designs a likelihood function which expresses some relation between the atomic coordinates of the structure and the desired constraint or property. With this input, our modified form of Boltz-2 will run twisted diffusion to draw samples from the posterior distribution. If you use this code for your applications, please cite our paper [Bayesian-Steered Structure Prediction of Mechanical Biomoleculues Using Twisted Diffusion](https://www.biorxiv.org/cgi/content/short/2026.05.11.724187v1).

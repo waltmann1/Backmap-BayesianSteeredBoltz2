@@ -23,6 +23,7 @@ import contextlib
 import json
 import os
 import re
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -34,6 +35,7 @@ import yaml
 from pytorch_lightning import Trainer, seed_everything
 from rdkit import Chem
 
+from boltz.colvars.cg_fixed import FixedAtoms, apply_transform  # noqa: F401  (apply_transform re-exported)
 from boltz.colvars.cg_potential import CGMap, CGPotential, cg_potential_parameters
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.types import Manifest
@@ -74,6 +76,10 @@ class CGSampleResult:
     structure_paths: list = field(default_factory=list)
     confidence: list = field(default_factory=list)
     bead_rmsd: list = field(default_factory=list)  # Angstrom, after alignment
+    # with ``fixed``: per structure, the rigid motion taking the structure's fixed atoms onto their known
+    # positions ({"rotation", "center_from", "center_to", "rmsd"}); ``apply_transform(xyz, tf)`` puts sampled
+    # coordinates into the known frame
+    fixed_transform: list = field(default_factory=list)
 
 
 def _kabsch_rmsd(fixed: np.ndarray, moving: np.ndarray) -> float:
@@ -120,6 +126,33 @@ def _check_chains(cg_map: CGMap, chain_ids: dict) -> None:
         raise ValueError(
             f"CG map uses chains {unknown} that are not in the Boltz input "
             f"(input chains: {sorted(chain_ids)})"
+        )
+
+
+def _check_fixed_settings(fixed: FixedAtoms, step_scale: float) -> None:
+    """Warn about settings under which the fixed atoms would not end exactly on their known positions."""
+    if abs(float(step_scale) - 1.0) > 1e-9:
+        warnings.warn(
+            f"fixed atoms with step_scale={step_scale}: the last step lands on x0 only for step_scale=1, so the "
+            "fixed atoms will not end exactly at their known positions",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _check_fixed_chains(fixed: FixedAtoms, cg_map: CGMap, chain_ids: dict) -> None:
+    """Fail on fixed chains the input lacks; warn if the CG map has no bead in them."""
+    unknown = sorted(fixed.chains - set(chain_ids))
+    if unknown:
+        raise ValueError(
+            f"fixed atoms in chains {unknown} that are not in the Boltz input (input chains: {sorted(chain_ids)})"
+        )
+    if not any(a[0] in fixed.chains for b in cg_map.beads if b.atoms for a in b.atoms):
+        warnings.warn(
+            "no CG bead lies in the fixed chains: the free chains' placement against them is then left to the "
+            "model's prior. Add the fixed chains' beads (and targets) to the CG map.",
+            UserWarning,
+            stacklevel=3,
         )
 
 
@@ -211,6 +244,9 @@ class CGSampler:
         allowed: float = 0.0,
         align_subset=None,
         extra_potentials: Sequence = (),
+        # fixed ("halo") atoms
+        fixed: Optional[FixedAtoms] = None,
+        fixed_template: bool = True,
         # sampling
         recycling_steps: int = 3,
         sampling_steps: int = 200,
@@ -243,12 +279,25 @@ class CGSampler:
         Boltz potentials you construct yourself); ``CGPotential`` is always last.
         ``schedules`` may override ``guidance_weight``, ``resampling_weight``
         and ``guidance_interval`` (a schedule object or a number).
+
+        ``fixed`` (a :class:`~boltz.colvars.cg_fixed.FixedAtoms`) holds those atoms exactly at their known
+        positions while the other chains are sampled; the CG map should include the fixed chains' beads. With
+        ``fixed_template=True`` (default) the fixed atoms are also given to the trunk as a non-forced template,
+        which needs ``inputs`` as a dict. See ``boltz.colvars.cg_fixed``. Physical potentials (e.g. Boltz's
+        VDWOverlap) are not used unless passed in ``extra_potentials``; see the README for what we learned.
         """
         if schedules:
             bad = set(schedules) - set(SCHEDULE_KNOBS)
             if bad:
                 raise ValueError(f"unknown schedules {sorted(bad)}; allowed: {SCHEDULE_KNOBS}")
         diffusion = self._check_diffusion(diffusion)
+        if fixed is not None:
+            if fixed_template and not isinstance(inputs, dict):
+                raise ValueError(
+                    "fixed_template=True needs `inputs` as a dict (the template is added to it); "
+                    "pass a dict or set fixed_template=False"
+                )
+            _check_fixed_settings(fixed, {**self.diffusion_defaults, **diffusion}.get("step_scale", 1.0))
         n_target = np.asarray(target).shape
         if n_target != (len(cg_map), 3):
             raise ValueError(f"target must be ({len(cg_map)}, 3), got {n_target}")
@@ -264,6 +313,9 @@ class CGSampler:
 
         out_dir = Path(out_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        if fixed is not None and fixed_template:
+            tpl = fixed.write_template(out_dir / f"{name}_fixed_template.pdb")
+            inputs = {**inputs, "templates": [*inputs.get("templates", []), fixed.template_entry(tpl)]}
         if isinstance(inputs, dict):
             data_path = out_dir / f"{name}.yaml"
             with open(data_path, "w") as f:
@@ -306,6 +358,8 @@ class CGSampler:
         record = filtered.records[0]
         chain_ids = {c.chain_name: int(c.chain_id) for c in record.chains}
         _check_chains(cg_map, chain_ids)
+        if fixed is not None:
+            _check_fixed_chains(fixed, cg_map, chain_ids)
 
         processed_dir = results_dir / "processed"
         processed = BoltzProcessedInput(
@@ -400,6 +454,9 @@ class CGSampler:
             extra_mols_dir=processed.extra_mols_dir,
             override_method=None,
         )
+        if fixed is not None:
+            sm.x0_hook = fixed.make_x0_hook(chain_ids)
+            sm.alignment_weights = fixed.make_alignment_weights(chain_ids)
         try:
             # The sampler writes scratch tensors (atom_coords.pt, argsort.pt,
             # resample_weights.pt) into the *current directory*; keep them with
@@ -408,13 +465,15 @@ class CGSampler:
             with contextlib.chdir(results_dir):
                 trainer.predict(model, datamodule=data_module, return_predictions=False)
         finally:
-            # do not leak this call's potentials into the cached model
+            # do not leak this call's potentials or fixed-atom hooks into the cached model
             model.steering_args = asdict(BoltzSteeringParams())
+            sm.x0_hook = None
+            sm.alignment_weights = None
 
-        return self._collect(results_dir, record.id, cg_map, target, output_format)
+        return self._collect(results_dir, record.id, cg_map, target, output_format, fixed)
 
     @staticmethod
-    def _collect(results_dir, rec_id, cg_map, target, output_format) -> CGSampleResult:
+    def _collect(results_dir, rec_id, cg_map, target, output_format, fixed=None) -> CGSampleResult:
         pred_dir = results_dir / "predictions" / rec_id
         ext = "pdb" if output_format == "pdb" else "cif"
 
@@ -429,6 +488,8 @@ class CGSampler:
             conf = pred_dir / f"confidence_{p.stem}.json"
             res.confidence.append(json.load(open(conf)) if conf.exists() else {})
             res.bead_rmsd.append(bead_rmsd_from_structure(cg_map, target, p))
+            if fixed is not None:
+                res.fixed_transform.append(fixed.transform_from_structure(p))
         return res
 
 
